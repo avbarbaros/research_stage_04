@@ -107,20 +107,45 @@ def parse_args() -> argparse.Namespace:
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
+def _get_model_class():
+    """
+    Return the correct VLM class for the installed transformers version.
+
+    transformers ≥ 4.52 / 5.x  ships Qwen2_5_VLForConditionalGeneration
+    for qwen2_5_vl checkpoints.  Older versions only have Qwen2VLForConditionalGeneration.
+    We always try the newer name first so there is no cross-version warning.
+    """
+    from transformers import AutoModelForVision2Seq
+    # AutoModelForVision2Seq dispatches to the right class automatically and
+    # works across both old and new transformers versions.
+    return AutoModelForVision2Seq
+
+
 def load_base_model(cfg: Dict) -> tuple:
     """Load Qwen2.5-VL and its processor."""
-    from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+    from transformers import AutoProcessor
 
     model_name = cfg["model"]["name"]
     dtype = getattr(torch, cfg["model"]["dtype"])
-    use_fa2 = cfg["model"].get("use_flash_attn", True)
-    attn_impl = "flash_attention_2" if use_fa2 else "sdpa"
+    use_fa2 = cfg["model"].get("use_flash_attn", False)
+
+    # Determine attention implementation, with automatic fallback
+    if use_fa2:
+        try:
+            import flash_attn  # noqa: F401
+            attn_impl = "flash_attention_2"
+        except ImportError:
+            print("[model] flash-attn not found — falling back to sdpa")
+            attn_impl = "sdpa"
+    else:
+        attn_impl = "sdpa"
 
     print(f"[model] Loading {model_name}  dtype={cfg['model']['dtype']}  attn={attn_impl}")
 
     processor = AutoProcessor.from_pretrained(model_name)
 
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    ModelClass = _get_model_class()
+    model = ModelClass.from_pretrained(
         model_name,
         torch_dtype=dtype,
         attn_implementation=attn_impl,

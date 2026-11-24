@@ -7,7 +7,7 @@
 model:
   name: Qwen/Qwen2.5-VL-7B-Instruct
   dtype: bfloat16
-  use_flash_attn: true          # requires flash-attn package; set false if not installed
+  use_flash_attn: false         # set true only if flash-attn is installed (pip install flash-attn)
 
 # ── LoRA ──────────────────────────────────────────────────────────────────────
 lora:
