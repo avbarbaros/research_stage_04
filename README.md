@@ -31,20 +31,27 @@ huggingface-cli login
 
 ## Image setup (one-time, Colab)
 
-`Xkev/LLaVA-CoT-100k` stores images as split zip archives in the HF repo.
-Run this **once** before the first training run (~15 GB download):
+`Xkev/LLaVA-CoT-100k` stores images as 16 split zip parts in the HF repo
+(**~170 GB** download, ~170 GB again once extracted). Run this **once**:
 
 ```bash
 python setup.py
 ```
 
-Image setup runs automatically as part of `python setup.py`. It downloads the
-full repo, merges the zip parts, and extracts images to `./data/llava_cot_images/`.
-Override the destination with:
+Image setup runs automatically as part of `python setup.py`. It downloads only
+the zip parts into the HF cache (local Colab disk, ~170 GB), then extracts the
+images **directly from the parts** (no merged `image.zip` is written) into
+`sft.local_image_dir` from `config.yaml` — e.g. a Google Drive folder, so the
+images persist across Colab sessions. Mount Drive first in a notebook cell:
 
-```bash
-python setup.py --image-out-dir /content/llava_cot_images
+```python
+from google.colab import drive; drive.mount('/content/drive')
 ```
+
+- Extraction is resumable: if Colab disconnects, re-run and finished files are skipped.
+- `--delete-parts` deletes the downloaded zip parts after a successful extraction.
+- `--image-out-dir <dir>` overrides the destination from `config.yaml`.
+- The Drive folder needs ~170 GB free.
 
 To skip the image download (env checks only):
 

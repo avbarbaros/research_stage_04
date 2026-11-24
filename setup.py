@@ -13,8 +13,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import bisect
+import fnmatch
 import importlib
+import io
 import sys
+from pathlib import Path
 from typing import List, Tuple
 
 REQUIRED = [
@@ -24,7 +28,7 @@ REQUIRED = [
     ("datasets",        "2.20.0"),
     ("peft",            "0.11.0"),
     ("trl",             "0.9.0"),
-    ("pyyaml",          "6.0"),
+    ("yaml",            "6.0"),           # pip install pyyaml
     ("huggingface_hub", "0.23.0"),
     ("wandb",           "0.17.0"),
     ("PIL",             None),          # Pillow — no version check
@@ -148,74 +152,226 @@ def check_model_accessible(check_only: bool) -> bool:
         return True  # non-fatal
 
 
-def setup_images(dataset_id: str, out_dir: str) -> bool:
+class _MultiPartReader(io.RawIOBase):
+    """
+    Read-only, seekable view over split zip parts (image.zip.part-aa, -ab, …)
+    as if they were one file. Lets zipfile read the archive in place, so the
+    ~171 GB merged image.zip never has to be written to disk.
+    """
+
+    def __init__(self, parts: List[Path]):
+        self._parts = parts
+        self._sizes = [p.stat().st_size for p in parts]
+        self._offsets = [0]
+        for s in self._sizes:
+            self._offsets.append(self._offsets[-1] + s)
+        self._size = self._offsets[-1]
+        self._pos = 0
+        self._fh = None
+        self._fh_idx = -1
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            pos = offset
+        elif whence == io.SEEK_CUR:
+            pos = self._pos + offset
+        elif whence == io.SEEK_END:
+            pos = self._size + offset
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+        if pos < 0:
+            raise ValueError("negative seek position")
+        self._pos = pos
+        return pos
+
+    def readinto(self, buf) -> int:
+        view = memoryview(buf).cast("B")
+        n_done = 0
+        while n_done < len(view) and self._pos < self._size:
+            idx = bisect.bisect_right(self._offsets, self._pos) - 1
+            if idx != self._fh_idx:
+                if self._fh:
+                    self._fh.close()
+                self._fh = open(self._parts[idx], "rb")
+                self._fh_idx = idx
+            local = self._pos - self._offsets[idx]
+            self._fh.seek(local)
+            want = min(len(view) - n_done, self._sizes[idx] - local)
+            got = self._fh.readinto(view[n_done:n_done + want])
+            if not got:
+                break
+            n_done += got
+            self._pos += got
+        return n_done
+
+    def close(self) -> None:
+        if self._fh:
+            self._fh.close()
+            self._fh = None
+        super().close()
+
+
+def _default_image_out_dir() -> str:
+    """sft.local_image_dir from config.yaml, else ./data/llava_cot_images."""
+    try:
+        import yaml
+        with open("config.yaml") as f:
+            cfg = yaml.safe_load(f) or {}
+        d = (cfg.get("sft") or {}).get("local_image_dir")
+        if d:
+            return str(d)
+    except Exception:
+        pass
+    return "./data/llava_cot_images"
+
+
+def _gb(n: float) -> str:
+    return f"{n / 1e9:.1f} GB"
+
+
+_EXTRACT_MARKER = ".llava_cot_extract_complete"
+
+
+def setup_images(dataset_id: str, out_dir: str, delete_parts: bool = False) -> bool:
     """
     Download and extract images for Xkev/LLaVA-CoT-100k (or similar datasets
     that ship images as split zip archives in the HF repo).
 
     Steps:
-      1. snapshot_download — fetches the full repo (JSONL + zip parts)
-      2. Merge image.zip.part-* → image.zip
-      3. unzip → <out_dir>/
-      4. Print the path to paste into config.yaml as sft.local_image_dir
+      1. snapshot_download only the image.zip.part-* files (HF cache, local disk)
+      2. Extract straight from the parts into <out_dir> (no merged image.zip)
+         — <out_dir> may be on Google Drive; extraction is resumable.
+      3. Optionally delete the downloaded parts (--delete-parts)
     """
-    import subprocess
+    import shutil
     import zipfile
 
     print("── Image setup ──────────────────────────────────────")
+    out_path = Path(out_dir).expanduser()
     print(f"  Dataset  : {dataset_id}")
-    print(f"  Output   : {out_dir}")
-    print("  Downloading repo (this may take a while) …")
+    print(f"  Output   : {out_path}")
+
+    if (out_path / _EXTRACT_MARKER).exists():
+        print(f"  ✓  Images already extracted at {out_path} — skipping")
+        return True
+
+    if str(out_path).startswith("/content/drive") and not Path("/content/drive/MyDrive").exists():
+        print("  ✗  Google Drive is not mounted. In a notebook cell run:")
+        print("       from google.colab import drive; drive.mount('/content/drive')")
+        return False
 
     try:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import HfApi, snapshot_download
     except ImportError:
         print("  ✗  huggingface_hub not installed")
         return False
 
+    patterns = ["image.zip.part-*", "image.zip"]
+
+    # Pre-flight: how big is the archive, and is there room for it?
     try:
-        repo_path = importlib.import_module("pathlib").Path(
-            snapshot_download(dataset_id, repo_type="dataset")
+        info = HfApi().dataset_info(dataset_id, files_metadata=True)
+        archive_bytes = sum(
+            (s.size or 0) for s in info.siblings
+            if fnmatch.fnmatch(s.rfilename, patterns[0]) or s.rfilename == patterns[1]
         )
+    except Exception:
+        archive_bytes = 0
+    if archive_bytes:
+        print(f"  Archive  : {_gb(archive_bytes)} (download to local disk, "
+              f"roughly the same again once extracted to the output dir)")
+        out_probe = out_path
+        while not out_probe.exists():
+            out_probe = out_probe.parent
+        free_out = shutil.disk_usage(out_probe).free
+        if free_out < archive_bytes:
+            print(f"  ⚠  Only {_gb(free_out)} reported free at {out_probe} — "
+                  "extraction may run out of space")
+
+    print("  Downloading zip parts (this may take a while; already-cached parts are reused) …")
+    try:
+        repo_path = Path(snapshot_download(
+            dataset_id, repo_type="dataset", allow_patterns=patterns,
+        ))
     except Exception as e:
         print(f"  ✗  snapshot_download failed: {e}")
+        print("     If the local disk is full, delete a stale image.zip in the HF cache:")
+        print("       rm -f ~/.cache/huggingface/hub/datasets--*/snapshots/*/image.zip")
         return False
 
-    # Merge split zip parts if present
     zip_parts = sorted(repo_path.glob("image.zip.part-*"))
-    combined = repo_path / "image.zip"
+    merged = repo_path / "image.zip"
 
-    if zip_parts and not combined.exists():
-        print(f"  Merging {len(zip_parts)} zip parts …")
-        try:
-            with open(combined, "wb") as fout:
-                for part in zip_parts:
-                    fout.write(part.read_bytes())
-        except Exception as e:
-            print(f"  ✗  Merge failed: {e}")
-            return False
+    # Older versions of this script wrote a merged image.zip next to the parts;
+    # if the parts exist that file is redundant (and possibly truncated).
+    if zip_parts and merged.exists() and not merged.is_symlink():
+        print(f"  Removing leftover merged archive {merged} ({_gb(merged.stat().st_size)})")
+        merged.unlink()
 
-    if not combined.exists():
+    if zip_parts:
+        print(f"  Reading {len(zip_parts)} zip parts in place (no merge needed)")
+        source = _MultiPartReader(zip_parts)
+    elif merged.exists():
+        source = open(merged, "rb")
+    else:
         print("  ✗  No image.zip or image.zip.part-* found in repo")
         return False
 
-    # Extract
-    out_path = importlib.import_module("pathlib").Path(out_dir)
-    if out_path.exists() and any(out_path.iterdir()):
-        print(f"  ✓  {out_path} already exists and is non-empty — skipping extraction")
-    else:
-        print(f"  Extracting to {out_path} …")
-        out_path.mkdir(parents=True, exist_ok=True)
-        try:
-            with zipfile.ZipFile(combined) as zf:
-                zf.extractall(out_path)
-        except Exception as e:
-            print(f"  ✗  Extraction failed: {e}")
-            return False
+    print(f"  Extracting to {out_path} …")
+    out_path.mkdir(parents=True, exist_ok=True)
+    try:
+        with source, zipfile.ZipFile(source) as zf:
+            members = [m for m in zf.infolist() if not m.is_dir()]
+            total = sum(m.file_size for m in members)
+            done_bytes = skipped = 0
+            try:
+                from tqdm import tqdm
+                bar = tqdm(total=total, unit="B", unit_scale=True, desc="  Extracting")
+            except ImportError:
+                bar = None
+            for m in members:
+                target = out_path / m.filename
+                # Resume support: skip files already fully written
+                if target.exists() and target.stat().st_size == m.file_size:
+                    skipped += 1
+                else:
+                    zf.extract(m, out_path)
+                done_bytes += m.file_size
+                if bar:
+                    bar.update(m.file_size)
+            if bar:
+                bar.close()
+    except Exception as e:
+        print(f"  ✗  Extraction failed: {e}")
+        print("     Re-run the same command to resume — finished files are skipped.")
+        return False
 
-    print(f"  ✓  Images ready at: {out_path}")
-    print(f"\n  Add this to config.yaml  →  sft.local_image_dir: {out_path}")
-    print(f"  Or pass on the CLI      →  --set sft.local_image_dir={out_path}")
+    (out_path / _EXTRACT_MARKER).write_text(f"{dataset_id}\n{len(members)} files\n")
+    print(f"  ✓  {len(members)} files ready at {out_path}"
+          + (f" ({skipped} already present)" if skipped else ""))
+
+    if delete_parts:
+        freed = 0
+        for p in zip_parts + ([merged] if merged.exists() else []):
+            real = p.resolve()          # HF cache snapshots are symlinks to blobs
+            freed += real.stat().st_size
+            real.unlink()
+            if p.is_symlink():
+                p.unlink()
+        print(f"  ✓  Deleted downloaded zip parts, freed {_gb(freed)}")
+    else:
+        print("     Tip: pass --delete-parts to free the local disk used by the zip parts.")
+
+    print(f"\n  config.yaml  →  sft.local_image_dir: {out_path}")
     return True
 
 
@@ -229,11 +385,15 @@ def main() -> None:
                    help="Skip the image download/extraction step")
     p.add_argument("--image-dataset", default="Xkev/LLaVA-CoT-100k",
                    help="HF dataset ID to download images from (default: Xkev/LLaVA-CoT-100k)")
-    p.add_argument("--image-out-dir", default="./data/llava_cot_images",
-                   help="Local directory to extract images into")
+    p.add_argument("--image-out-dir", default=None,
+                   help="Directory to extract images into "
+                        "(default: sft.local_image_dir from config.yaml)")
+    p.add_argument("--delete-parts", action="store_true",
+                   help="Delete the downloaded zip parts after successful extraction")
     args = p.parse_args()
 
     run_image_setup = not args.exclude_setup_images and not args.check_only
+    image_out_dir = args.image_out_dir or _default_image_out_dir()
 
     print("\n╔══ Stage 4 Environment Check ══════════════════════╗")
     checks: List[Tuple[str, bool]] = [
@@ -245,7 +405,7 @@ def main() -> None:
         ("Model access",   check_model_accessible(args.check_only)),
     ]
     if run_image_setup:
-        checks.append(("Image setup", setup_images(args.image_dataset, args.image_out_dir)))
+        checks.append(("Image setup", setup_images(args.image_dataset, image_out_dir, args.delete_parts)))
     else:
         print("── Image setup ──────────────────────────────────────")
         print("  –  Skipped (--exclude-setup-images or --check-only)")
