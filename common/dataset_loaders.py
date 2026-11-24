@@ -7,6 +7,7 @@ Eval sources: AI4Math/MathVista, MathLLMs/MathVision, MMMU/MMMU
 
 from __future__ import annotations
 
+import base64
 import io
 import random
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,15 @@ def _to_pil(image_field: Any) -> Optional[Image.Image]:
         return Image.open(io.BytesIO(image_field)).convert("RGB")
     if isinstance(image_field, dict) and "bytes" in image_field:
         return Image.open(io.BytesIO(image_field["bytes"])).convert("RGB")
+    if isinstance(image_field, str):
+        # Strip optional data-URL prefix (e.g. "data:image/jpeg;base64,...")
+        raw = image_field
+        if "," in raw and raw.startswith("data:"):
+            raw = raw.split(",", 1)[1]
+        try:
+            return Image.open(io.BytesIO(base64.b64decode(raw))).convert("RGB")
+        except Exception:
+            pass
     return None
 
 
@@ -68,6 +78,15 @@ def load_sft_dataset(
         ex = _parse_sft_row(row, i)
         if ex is not None:
             examples.append(ex)
+
+    if len(examples) == 0 and len(ds) > 0:
+        sample = dict(ds[0])
+        # Truncate long values for readability
+        preview = {k: (str(v)[:80] if not isinstance(v, (int, float, bool)) else v)
+                   for k, v in sample.items()}
+        print(f"[dataset] WARNING: 0 valid examples parsed from {len(ds)} rows.")
+        print(f"[dataset] First row keys: {list(sample.keys())}")
+        print(f"[dataset] First row preview: {preview}")
 
     print(f"[dataset] Parsed {len(examples)} valid examples")
     examples = _select_subset(examples, max_samples, seed)

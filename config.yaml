@@ -26,7 +26,7 @@ lora:
 
 # ── SFT (E4.1) ────────────────────────────────────────────────────────────────
 sft:
-  dataset_id: lmms-lab/LLaVA-CoT-100k
+  dataset_id: Xkev/LLaVA-CoT-100k
   # dataset_id: Orion-zhen/multimodal-cot-dataset   # alternative fallback
   max_samples: 50000      # null = use full dataset; use 1000 for a quick smoke-test
   num_train_epochs: 1

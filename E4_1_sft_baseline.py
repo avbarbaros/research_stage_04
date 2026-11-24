@@ -220,6 +220,13 @@ def run_training(cfg: Dict, model: Any, processor: Any, run_dir: Path) -> Path:
 
     checkpoints_dir = run_dir / sc.get("checkpoints_subdir", "checkpoints")
 
+    # Compute warmup_steps manually — warmup_ratio was removed in transformers 5.x
+    total_steps = max(1, (
+        len(dataset)
+        // (sc["per_device_train_batch_size"] * sc["gradient_accumulation_steps"])
+    ) * sc["num_train_epochs"])
+    warmup_steps = max(1, int(total_steps * sc.get("warmup_ratio", 0.03)))
+
     training_args = TrainingArguments(
         output_dir=str(checkpoints_dir),
         num_train_epochs=sc["num_train_epochs"],
@@ -227,7 +234,7 @@ def run_training(cfg: Dict, model: Any, processor: Any, run_dir: Path) -> Path:
         gradient_accumulation_steps=sc["gradient_accumulation_steps"],
         learning_rate=sc["learning_rate"],
         lr_scheduler_type=sc.get("lr_scheduler_type", "cosine"),
-        warmup_ratio=sc.get("warmup_ratio", 0.03),
+        warmup_steps=warmup_steps,
         weight_decay=sc.get("weight_decay", 0.01),
         max_grad_norm=sc.get("max_grad_norm", 1.0),
         bf16=True,
