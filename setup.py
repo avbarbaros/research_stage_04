@@ -28,6 +28,9 @@ REQUIRED = [
     ("huggingface_hub", "0.23.0"),
     ("wandb",           "0.17.0"),
     ("PIL",             None),          # Pillow — no version check
+    # torchao is an optional PEFT dependency; if present it must be ≥ 0.16.0
+    # (peft 0.21+ raises ImportError if torchao < 0.16.0 is installed)
+    ("torchao",         "0.16.0"),
 ]
 
 
