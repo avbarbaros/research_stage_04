@@ -67,11 +67,20 @@ def load_sft_dataset(
       2. LLaVA-CoT format            {"problem": ..., "solution": ...}
       3. Generic instruction format  {"question": ..., "answer": ...}
     """
-    from datasets import load_dataset
+    from datasets import load_dataset, Image as HFImage
 
     print(f"[dataset] Loading SFT dataset: {dataset_id}")
-    ds = load_dataset(dataset_id, split="train", trust_remote_code=True)
+    ds = load_dataset(dataset_id, split="train")
     print(f"[dataset] Raw size: {len(ds)}")
+
+    # If the image column holds file-path strings, cast it so HF downloads
+    # the actual image bytes from the dataset repo.
+    if "image" in ds.column_names:
+        try:
+            ds = ds.cast_column("image", HFImage())
+            print("[dataset] Image column cast to HFImage (path → bytes)")
+        except Exception as e:
+            print(f"[dataset] cast_column skipped: {e}")
 
     examples = []
     for i, row in enumerate(ds):
@@ -103,6 +112,18 @@ def _parse_sft_row(row: dict, idx: int) -> Optional[Dict]:
     # Format 1: LLaVA conversations
     if "conversations" in row:
         convs = row["conversations"]
+        # Some datasets serialise the list as a Python-repr string
+        if isinstance(convs, str):
+            import ast, json
+            try:
+                convs = json.loads(convs)
+            except Exception:
+                try:
+                    convs = ast.literal_eval(convs)
+                except Exception:
+                    return None
+        if not isinstance(convs, list):
+            return None
         human = next((c for c in convs if c.get("from") in ("human", "user")), None)
         gpt = next((c for c in convs if c.get("from") in ("gpt", "assistant")), None)
         if human is None or gpt is None:
