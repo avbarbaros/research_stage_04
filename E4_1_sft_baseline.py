@@ -111,14 +111,24 @@ def _get_model_class():
     """
     Return the correct VLM class for the installed transformers version.
 
-    transformers ≥ 4.52 / 5.x  ships Qwen2_5_VLForConditionalGeneration
-    for qwen2_5_vl checkpoints.  Older versions only have Qwen2VLForConditionalGeneration.
-    We always try the newer name first so there is no cross-version warning.
+    Try class names from newest to oldest so there is no cross-version warning:
+      1. Qwen2_5_VLForConditionalGeneration  (transformers ≥ 4.52, matches qwen2_5_vl config)
+      2. Qwen2VLForConditionalGeneration      (older transformers, still works with a warning)
     """
-    from transformers import AutoModelForVision2Seq
-    # AutoModelForVision2Seq dispatches to the right class automatically and
-    # works across both old and new transformers versions.
-    return AutoModelForVision2Seq
+    import transformers
+    for class_name in (
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen2VLForConditionalGeneration",
+    ):
+        cls = getattr(transformers, class_name, None)
+        if cls is not None:
+            print(f"[model] Using model class: {class_name}")
+            return cls
+    raise ImportError(
+        "Could not find Qwen2_5_VLForConditionalGeneration or "
+        "Qwen2VLForConditionalGeneration in the installed transformers package. "
+        f"Installed version: {transformers.__version__}"
+    )
 
 
 def load_base_model(cfg: Dict) -> tuple:
