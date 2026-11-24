@@ -214,6 +214,7 @@ def run_training(cfg: Dict, model: Any, processor: Any, run_dir: Path) -> Path:
         dataset_id=sc["dataset_id"],
         max_samples=sc.get("max_samples"),
         seed=cfg["seed"],
+        local_image_dir=sc.get("local_image_dir"),
     )
     dataset = _SFTDataset(examples)
     collator = VLMSFTCollator(processor=processor, max_seq_len=sc["max_seq_len"])

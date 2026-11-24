@@ -28,6 +28,9 @@ lora:
 sft:
   dataset_id: Xkev/LLaVA-CoT-100k
   # dataset_id: Orion-zhen/multimodal-cot-dataset   # alternative fallback
+  # Images in Xkev/LLaVA-CoT-100k are stored as zip archives; extract them
+  # first (see README "Image setup") then set local_image_dir to the extract root.
+  local_image_dir: null   # e.g. /content/llava_cot/images
   max_samples: 50000      # null = use full dataset; use 1000 for a quick smoke-test
   num_train_epochs: 1
   per_device_train_batch_size: 2

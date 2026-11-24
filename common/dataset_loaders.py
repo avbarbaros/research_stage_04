@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import io
 import random
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from PIL import Image
@@ -27,8 +28,21 @@ def _to_pil(image_field: Any) -> Optional[Image.Image]:
         return Image.open(io.BytesIO(image_field)).convert("RGB")
     if isinstance(image_field, dict) and "bytes" in image_field:
         return Image.open(io.BytesIO(image_field["bytes"])).convert("RGB")
+    # Path object (resolved by caller from local_image_dir)
+    if isinstance(image_field, Path):
+        try:
+            return Image.open(image_field).convert("RGB")
+        except Exception:
+            return None
     if isinstance(image_field, str):
-        # Strip optional data-URL prefix (e.g. "data:image/jpeg;base64,...")
+        # Try as a local file path first
+        p = Path(image_field)
+        if p.exists():
+            try:
+                return Image.open(p).convert("RGB")
+            except Exception:
+                pass
+        # Try base64 (strip optional data-URL prefix)
         raw = image_field
         if "," in raw and raw.startswith("data:"):
             raw = raw.split(",", 1)[1]
@@ -52,6 +66,7 @@ def load_sft_dataset(
     dataset_id: str,
     max_samples: Optional[int],
     seed: int,
+    local_image_dir: Optional[str] = None,
 ) -> List[Dict]:
     """
     Load a multimodal CoT dataset for supervised fine-tuning.
@@ -66,36 +81,47 @@ def load_sft_dataset(
       1. LLaVA conversations format  {"conversations": [{"from":"human",...}, {"from":"gpt",...}]}
       2. LLaVA-CoT format            {"problem": ..., "solution": ...}
       3. Generic instruction format  {"question": ..., "answer": ...}
+
+    local_image_dir
+        For datasets whose image column contains file-path strings (e.g.
+        Xkev/LLaVA-CoT-100k), point this at the directory that contains the
+        extracted image files.  See README for the one-time Colab setup command.
     """
-    from datasets import load_dataset, Image as HFImage
+    from datasets import load_dataset
 
     print(f"[dataset] Loading SFT dataset: {dataset_id}")
     ds = load_dataset(dataset_id, split="train")
     print(f"[dataset] Raw size: {len(ds)}")
 
-    # If the image column holds file-path strings, cast it so HF downloads
-    # the actual image bytes from the dataset repo.
-    if "image" in ds.column_names:
-        try:
-            ds = ds.cast_column("image", HFImage())
-            print("[dataset] Image column cast to HFImage (path → bytes)")
-        except Exception as e:
-            print(f"[dataset] cast_column skipped: {e}")
+    img_root = Path(local_image_dir) if local_image_dir else None
+    if img_root:
+        print(f"[dataset] Local image dir: {img_root}")
 
     examples = []
+    # Scan enough rows to cover max_samples with some headroom for skipped rows.
+    # For a smoke test this avoids iterating all 98k rows; for a full run
+    # (max_samples=None) it scans everything.
+    scan_limit = None if max_samples is None else max_samples * 10
     for i, row in enumerate(ds):
-        ex = _parse_sft_row(row, i)
+        if scan_limit and i >= scan_limit:
+            break
+        ex = _parse_sft_row(row, i, img_root)
         if ex is not None:
             examples.append(ex)
+        # Once we have 2× max_samples valid examples we can stop early
+        if max_samples and len(examples) >= max_samples * 2:
+            break
 
     if len(examples) == 0 and len(ds) > 0:
         sample = dict(ds[0])
-        # Truncate long values for readability
         preview = {k: (str(v)[:80] if not isinstance(v, (int, float, bool)) else v)
                    for k, v in sample.items()}
-        print(f"[dataset] WARNING: 0 valid examples parsed from {len(ds)} rows.")
-        print(f"[dataset] First row keys: {list(sample.keys())}")
+        print(f"[dataset] WARNING: 0 valid examples parsed.")
+        print(f"[dataset] First row keys : {list(sample.keys())}")
         print(f"[dataset] First row preview: {preview}")
+        if "image" in sample and isinstance(sample["image"], str):
+            print("[dataset] HINT: image column contains file paths — "
+                  "set sft.local_image_dir to the extracted image directory.")
 
     print(f"[dataset] Parsed {len(examples)} valid examples")
     examples = _select_subset(examples, max_samples, seed)
@@ -103,20 +129,29 @@ def load_sft_dataset(
     return examples
 
 
-def _parse_sft_row(row: dict, idx: int) -> Optional[Dict]:
+def _parse_sft_row(
+    row: dict,
+    idx: int,
+    img_root: Optional[Path] = None,
+) -> Optional[Dict]:
     """Parse one row from an SFT dataset into the normalised format."""
-    image = _to_pil(row.get("image"))
+    img_field = row.get("image")
+    # Resolve relative path strings against the local image root
+    if isinstance(img_field, str) and img_root is not None:
+        img_field = img_root / img_field
+    image = _to_pil(img_field)
     if image is None:
-        return None  # skip text-only rows
+        return None  # skip rows whose image cannot be loaded
 
     # Format 1: LLaVA conversations
     if "conversations" in row:
         convs = row["conversations"]
         # Some datasets serialise the list as a Python-repr string
         if isinstance(convs, str):
-            import ast, json
+            import ast
+            import json as _json
             try:
-                convs = json.loads(convs)
+                convs = _json.loads(convs)
             except Exception:
                 try:
                     convs = ast.literal_eval(convs)

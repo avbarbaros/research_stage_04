@@ -148,11 +148,92 @@ def check_model_accessible(check_only: bool) -> bool:
         return True  # non-fatal
 
 
+def setup_images(dataset_id: str, out_dir: str) -> bool:
+    """
+    Download and extract images for Xkev/LLaVA-CoT-100k (or similar datasets
+    that ship images as split zip archives in the HF repo).
+
+    Steps:
+      1. snapshot_download — fetches the full repo (JSONL + zip parts)
+      2. Merge image.zip.part-* → image.zip
+      3. unzip → <out_dir>/
+      4. Print the path to paste into config.yaml as sft.local_image_dir
+    """
+    import subprocess
+    import zipfile
+
+    print("── Image setup ──────────────────────────────────────")
+    print(f"  Dataset  : {dataset_id}")
+    print(f"  Output   : {out_dir}")
+    print("  Downloading repo (this may take a while) …")
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        print("  ✗  huggingface_hub not installed")
+        return False
+
+    try:
+        repo_path = importlib.import_module("pathlib").Path(
+            snapshot_download(dataset_id, repo_type="dataset")
+        )
+    except Exception as e:
+        print(f"  ✗  snapshot_download failed: {e}")
+        return False
+
+    # Merge split zip parts if present
+    zip_parts = sorted(repo_path.glob("image.zip.part-*"))
+    combined = repo_path / "image.zip"
+
+    if zip_parts and not combined.exists():
+        print(f"  Merging {len(zip_parts)} zip parts …")
+        try:
+            with open(combined, "wb") as fout:
+                for part in zip_parts:
+                    fout.write(part.read_bytes())
+        except Exception as e:
+            print(f"  ✗  Merge failed: {e}")
+            return False
+
+    if not combined.exists():
+        print("  ✗  No image.zip or image.zip.part-* found in repo")
+        return False
+
+    # Extract
+    out_path = importlib.import_module("pathlib").Path(out_dir)
+    if out_path.exists() and any(out_path.iterdir()):
+        print(f"  ✓  {out_path} already exists and is non-empty — skipping extraction")
+    else:
+        print(f"  Extracting to {out_path} …")
+        out_path.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(combined) as zf:
+                zf.extractall(out_path)
+        except Exception as e:
+            print(f"  ✗  Extraction failed: {e}")
+            return False
+
+    print(f"  ✓  Images ready at: {out_path}")
+    print(f"\n  Add this to config.yaml  →  sft.local_image_dir: {out_path}")
+    print(f"  Or pass on the CLI      →  --set sft.local_image_dir={out_path}")
+    return True
+
+
 def main() -> None:
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        description="Stage 4 environment check + one-time image setup",
+    )
     p.add_argument("--check-only", action="store_true",
-                   help="Skip HF auth and model-access checks")
+                   help="Skip HF auth, model-access, and image-setup steps")
+    p.add_argument("--exclude-setup-images", action="store_true",
+                   help="Skip the image download/extraction step")
+    p.add_argument("--image-dataset", default="Xkev/LLaVA-CoT-100k",
+                   help="HF dataset ID to download images from (default: Xkev/LLaVA-CoT-100k)")
+    p.add_argument("--image-out-dir", default="./data/llava_cot_images",
+                   help="Local directory to extract images into")
     args = p.parse_args()
+
+    run_image_setup = not args.exclude_setup_images and not args.check_only
 
     print("\n╔══ Stage 4 Environment Check ══════════════════════╗")
     checks: List[Tuple[str, bool]] = [
@@ -163,6 +244,11 @@ def main() -> None:
         ("HF auth",        check_hf_auth(args.check_only)),
         ("Model access",   check_model_accessible(args.check_only)),
     ]
+    if run_image_setup:
+        checks.append(("Image setup", setup_images(args.image_dataset, args.image_out_dir)))
+    else:
+        print("── Image setup ──────────────────────────────────────")
+        print("  –  Skipped (--exclude-setup-images or --check-only)")
     print("╚════════════════════════════════════════════════════╝\n")
 
     all_ok = all(ok for _, ok in checks)

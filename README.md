@@ -29,6 +29,43 @@ python setup.py
 huggingface-cli login
 ```
 
+## Image setup (one-time, Colab)
+
+`Xkev/LLaVA-CoT-100k` stores images as split zip archives in the HF repo.
+Run this **once** before the first training run (~15 GB download):
+
+```bash
+python setup.py
+```
+
+Image setup runs automatically as part of `python setup.py`. It downloads the
+full repo, merges the zip parts, and extracts images to `./data/llava_cot_images/`.
+Override the destination with:
+
+```bash
+python setup.py --image-out-dir /content/llava_cot_images
+```
+
+To skip the image download (env checks only):
+
+```bash
+python setup.py --exclude-setup-images
+```
+
+When it finishes it prints the exact line to add to `config.yaml` or the
+`--set` flag to use on the command line:
+
+```bash
+python E4_1_sft_baseline.py \
+    --set sft.local_image_dir=/content/llava_cot_images \
+    --set sft.max_samples=1000 \
+    --set eval.mathvista.max_samples=100 \
+    --set eval.mathvision.max_samples=100 \
+    --set eval.mmmu.max_samples=100
+```
+
+Or set `local_image_dir` permanently in `config.yaml` and run without the flag.
+
 ## E4.1 — SFT Baseline
 
 ```bash
