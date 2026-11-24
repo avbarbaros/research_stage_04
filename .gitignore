@@ -1,0 +1,9 @@
+outputs/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.env
+*.ipynb_checkpoints/
+wandb/
+.DS_Store

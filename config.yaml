@@ -1,0 +1,78 @@
+# Stage 4 — Reinforcement Learning Post-Training
+# Central configuration for all experiments (E4.1 – E4.7).
+# Override any value from the CLI with --set key.path=value
+# Example: --set sft.max_samples=1000  --set model.name=Qwen/Qwen2.5-VL-3B-Instruct
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  name: Qwen/Qwen2.5-VL-7B-Instruct
+  dtype: bfloat16
+  use_flash_attn: true          # requires flash-attn package; set false if not installed
+
+# ── LoRA ──────────────────────────────────────────────────────────────────────
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: none
+
+# ── SFT (E4.1) ────────────────────────────────────────────────────────────────
+sft:
+  dataset_id: lmms-lab/LLaVA-CoT-100k
+  # dataset_id: Orion-zhen/multimodal-cot-dataset   # alternative fallback
+  max_samples: 50000      # null = use full dataset; use 1000 for a quick smoke-test
+  num_train_epochs: 1
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8   # effective batch size = 16
+  learning_rate: 2.0e-5
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_seq_len: 2048
+  dataloader_num_workers: 2
+  logging_steps: 50
+  save_steps: 500
+  save_total_limit: 2
+  # output subdir inside output_root/e4_1/<run_name>/
+  checkpoints_subdir: checkpoints
+  adapter_subdir: adapter_final
+
+# ── Evaluation benchmarks ─────────────────────────────────────────────────────
+eval:
+  mathvista:
+    dataset_id: AI4Math/MathVista
+    split: testmini
+    max_samples: 1000           # testmini has exactly 1000; use null for all
+  mathvision:
+    dataset_id: MathLLMs/MathVision
+    split: test
+    max_samples: 300            # full set is 3040; 300 for speed, null for full
+  mmmu:
+    dataset_id: MMMU/MMMU
+    split: validation
+    max_samples: 500            # validation is 11.5k; 500 for speed, null for full
+    subjects: null              # null = sample across all subjects
+
+# ── Generation (inference) ────────────────────────────────────────────────────
+generation:
+  max_new_tokens: 1024
+  temperature: 0.0
+  do_sample: false
+
+# ── W&B ───────────────────────────────────────────────────────────────────────
+wandb:
+  project: research_stage_04
+  run_name: e4_1_sft_baseline   # overridden per experiment
+
+# ── Global ────────────────────────────────────────────────────────────────────
+seed: 42
+output_root: outputs
