@@ -38,18 +38,22 @@ huggingface-cli login
 python setup.py
 ```
 
-Image setup runs automatically as part of `python setup.py`. It downloads only
-the zip parts into the HF cache (local Colab disk, ~170 GB), then extracts the
-images **directly from the parts** (no merged `image.zip` is written) into
-`sft.local_image_dir` from `config.yaml` — e.g. a Google Drive folder, so the
-images persist across Colab sessions. Mount Drive first in a notebook cell:
+Image setup runs automatically as part of `python setup.py`. It streams the
+archive part by part: each zip part (~10 GB) is downloaded to a local scratch dir
+(`./data/_image_zip_parts`) only when extraction reaches it, images are extracted
+straight into `sft.local_image_dir` from `config.yaml` (e.g. a Google Drive folder,
+so they persist across Colab sessions), and each part is **deleted as soon as all
+files stored in it are extracted**. Peak local disk use is ~3–4 parts (~40 GB), so
+it fits in a 225 GB Colab session. Mount Drive first in a notebook cell:
 
 ```python
 from google.colab import drive; drive.mount('/content/drive')
 ```
 
-- Extraction is resumable: if Colab disconnects, re-run and finished files are skipped.
-- `--delete-parts` deletes the downloaded zip parts after a successful extraction.
+- Resumable: if Colab disconnects, re-run — finished files are skipped and parts
+  containing only finished files are not downloaded again.
+- `--keep-parts` keeps the zip parts instead of deleting them.
+- `--parts-dir <dir>` changes the local scratch dir for parts.
 - `--image-out-dir <dir>` overrides the destination from `config.yaml`.
 - The Drive folder needs ~170 GB free.
 

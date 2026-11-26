@@ -155,21 +155,44 @@ def check_model_accessible(check_only: bool) -> bool:
 class _MultiPartReader(io.RawIOBase):
     """
     Read-only, seekable view over split zip parts (image.zip.part-aa, -ab, …)
-    as if they were one file. Lets zipfile read the archive in place, so the
-    ~171 GB merged image.zip never has to be written to disk.
+    as if they were one file, so zipfile can read the archive without a merged
+    image.zip ever being written.
+
+    Parts are fetched lazily through ``fetch(idx) -> Path`` the first time a
+    byte inside them is read, and can be dropped again with ``release(idx)``.
+    Together this lets the caller keep only a few parts on disk at a time.
     """
 
-    def __init__(self, parts: List[Path]):
-        self._parts = parts
-        self._sizes = [p.stat().st_size for p in parts]
+    def __init__(self, sizes: List[int], fetch):
+        self._sizes = list(sizes)
         self._offsets = [0]
         for s in self._sizes:
             self._offsets.append(self._offsets[-1] + s)
         self._size = self._offsets[-1]
+        self._fetch = fetch
+        self._paths: dict = {}      # idx -> local Path of fetched parts
         self._pos = 0
         self._fh = None
         self._fh_idx = -1
 
+    # ── part bookkeeping ──
+    def part_index(self, pos: int) -> int:
+        return bisect.bisect_right(self._offsets, pos) - 1
+
+    def part_end(self, idx: int) -> int:
+        return self._offsets[idx + 1]
+
+    def loaded(self) -> List[int]:
+        return sorted(self._paths)
+
+    def release(self, idx: int):
+        """Forget part idx (closing its handle); returns its path or None."""
+        if idx == self._fh_idx:
+            self._fh.close()
+            self._fh, self._fh_idx = None, -1
+        return self._paths.pop(idx, None)
+
+    # ── file-object protocol ──
     def readable(self) -> bool:
         return True
 
@@ -197,18 +220,20 @@ class _MultiPartReader(io.RawIOBase):
         view = memoryview(buf).cast("B")
         n_done = 0
         while n_done < len(view) and self._pos < self._size:
-            idx = bisect.bisect_right(self._offsets, self._pos) - 1
+            idx = self.part_index(self._pos)
+            if idx not in self._paths:
+                self._paths[idx] = Path(self._fetch(idx))
             if idx != self._fh_idx:
                 if self._fh:
                     self._fh.close()
-                self._fh = open(self._parts[idx], "rb")
+                self._fh = open(self._paths[idx], "rb")
                 self._fh_idx = idx
             local = self._pos - self._offsets[idx]
             self._fh.seek(local)
             want = min(len(view) - n_done, self._sizes[idx] - local)
             got = self._fh.readinto(view[n_done:n_done + want])
             if not got:
-                break
+                raise IOError(f"unexpected end of zip part {self._paths[idx]}")
             n_done += got
             self._pos += got
         return n_done
@@ -238,27 +263,46 @@ def _gb(n: float) -> str:
     return f"{n / 1e9:.1f} GB"
 
 
+def _delete_file(p: Path) -> int:
+    """Delete p (following an HF-cache symlink to its blob); returns bytes freed."""
+    real = p.resolve()
+    freed = real.stat().st_size if real.exists() else 0
+    real.unlink(missing_ok=True)
+    if p.is_symlink():
+        p.unlink()
+    return freed
+
+
 _EXTRACT_MARKER = ".llava_cot_extract_complete"
 
 
-def setup_images(dataset_id: str, out_dir: str, delete_parts: bool = False) -> bool:
+def setup_images(dataset_id: str, out_dir: str, parts_dir: str,
+                 keep_parts: bool = False) -> bool:
     """
     Download and extract images for Xkev/LLaVA-CoT-100k (or similar datasets
-    that ship images as split zip archives in the HF repo).
+    that ship images as split zip archives in the HF repo), using little
+    local disk.
 
-    Steps:
-      1. snapshot_download only the image.zip.part-* files (HF cache, local disk)
-      2. Extract straight from the parts into <out_dir> (no merged image.zip)
-         — <out_dir> may be on Google Drive; extraction is resumable.
-      3. Optionally delete the downloaded parts (--delete-parts)
+    The parts are byte-slices of ONE zip (a file can straddle two parts and
+    the zip index lives in the last part), so they can't be unzipped one by
+    one. Instead:
+      1. Download the part(s) holding the zip index (end of the archive).
+      2. Extract files in on-disk order into <out_dir> (may be Google Drive),
+         downloading each part only when extraction reaches it.
+      3. Delete each part as soon as every file stored in it is extracted
+         (unless --keep-parts). Peak local usage ≈ 2–3 parts (~10 GB each).
+    Re-running resumes: finished files are skipped, and parts that contain
+    only finished files are never downloaded again.
     """
     import shutil
     import zipfile
 
     print("── Image setup ──────────────────────────────────────")
     out_path = Path(out_dir).expanduser()
+    parts_path = Path(parts_dir).expanduser()
     print(f"  Dataset  : {dataset_id}")
     print(f"  Output   : {out_path}")
+    print(f"  Parts dir: {parts_path}  (temporary, local disk)")
 
     if (out_path / _EXTRACT_MARKER).exists():
         print(f"  ✓  Images already extracted at {out_path} — skipping")
@@ -270,107 +314,124 @@ def setup_images(dataset_id: str, out_dir: str, delete_parts: bool = False) -> b
         return False
 
     try:
-        from huggingface_hub import HfApi, snapshot_download
+        from huggingface_hub import HfApi, hf_hub_download, try_to_load_from_cache
+        from huggingface_hub.constants import HF_HUB_CACHE
     except ImportError:
         print("  ✗  huggingface_hub not installed")
         return False
 
-    patterns = ["image.zip.part-*", "image.zip"]
-
-    # Pre-flight: how big is the archive, and is there room for it?
+    # ── list archive parts and their sizes (needed to map offsets → parts) ──
     try:
         info = HfApi().dataset_info(dataset_id, files_metadata=True)
-        archive_bytes = sum(
-            (s.size or 0) for s in info.siblings
-            if fnmatch.fnmatch(s.rfilename, patterns[0]) or s.rfilename == patterns[1]
-        )
-    except Exception:
-        archive_bytes = 0
-    if archive_bytes:
-        print(f"  Archive  : {_gb(archive_bytes)} (download to local disk, "
-              f"roughly the same again once extracted to the output dir)")
-        out_probe = out_path
-        while not out_probe.exists():
-            out_probe = out_probe.parent
-        free_out = shutil.disk_usage(out_probe).free
-        if free_out < archive_bytes:
-            print(f"  ⚠  Only {_gb(free_out)} reported free at {out_probe} — "
-                  "extraction may run out of space")
-
-    print("  Downloading zip parts (this may take a while; already-cached parts are reused) …")
-    try:
-        repo_path = Path(snapshot_download(
-            dataset_id, repo_type="dataset", allow_patterns=patterns,
-        ))
+        repo_files = {s.rfilename: s.size for s in info.siblings}
     except Exception as e:
-        print(f"  ✗  snapshot_download failed: {e}")
-        print("     If the local disk is full, delete a stale image.zip in the HF cache:")
-        print("       rm -f ~/.cache/huggingface/hub/datasets--*/snapshots/*/image.zip")
+        print(f"  ✗  Could not list files of {dataset_id}: {e}")
         return False
-
-    zip_parts = sorted(repo_path.glob("image.zip.part-*"))
-    merged = repo_path / "image.zip"
-
-    # Older versions of this script wrote a merged image.zip next to the parts;
-    # if the parts exist that file is redundant (and possibly truncated).
-    if zip_parts and merged.exists() and not merged.is_symlink():
-        print(f"  Removing leftover merged archive {merged} ({_gb(merged.stat().st_size)})")
-        merged.unlink()
-
-    if zip_parts:
-        print(f"  Reading {len(zip_parts)} zip parts in place (no merge needed)")
-        source = _MultiPartReader(zip_parts)
-    elif merged.exists():
-        source = open(merged, "rb")
-    else:
+    part_names = sorted(f for f in repo_files if fnmatch.fnmatch(f, "image.zip.part-*"))
+    if not part_names and "image.zip" in repo_files:
+        part_names = ["image.zip"]
+    if not part_names:
         print("  ✗  No image.zip or image.zip.part-* found in repo")
         return False
+    sizes = [repo_files[n] for n in part_names]
+    if any(s is None for s in sizes):
+        print("  ✗  Hub did not report part sizes; cannot stream the archive")
+        return False
+    print(f"  Archive  : {_gb(sum(sizes))} in {len(part_names)} part(s), "
+          f"largest {_gb(max(sizes))}")
+
+    # Leftover merged image.zip written by older versions of this script
+    # into the HF cache (up to ~171 GB of wasted local disk).
+    if part_names[0] != "image.zip":
+        repo_cache = Path(HF_HUB_CACHE) / f"datasets--{dataset_id.replace('/', '--')}"
+        for stale in repo_cache.glob("snapshots/*/image.zip"):
+            if not stale.is_symlink():
+                print(f"  Removing leftover merged archive {stale} ({_gb(stale.stat().st_size)})")
+                stale.unlink()
+
+    out_probe = out_path
+    while not out_probe.exists():
+        out_probe = out_probe.parent
+    if shutil.disk_usage(out_probe).free < sum(sizes):
+        print(f"  ⚠  Only {_gb(shutil.disk_usage(out_probe).free)} reported free at "
+              f"{out_probe} — extraction may run out of space")
+
+    parts_path.mkdir(parents=True, exist_ok=True)
+    stats = {"downloaded": 0, "freed": 0}
+
+    def fetch(idx: int) -> Path:
+        name, size = part_names[idx], sizes[idx]
+        local = parts_path / name
+        if local.exists() and local.stat().st_size == size:
+            return local                                   # from an earlier run
+        cached = try_to_load_from_cache(dataset_id, name, repo_type="dataset")
+        if isinstance(cached, str) and Path(cached).exists() \
+                and Path(cached).resolve().stat().st_size == size:
+            return Path(cached)                            # from the HF cache
+        free = shutil.disk_usage(parts_path).free
+        if free < size:
+            raise OSError(f"need {_gb(size)} for {name} but only {_gb(free)} free "
+                          f"in {parts_path}")
+        print(f"\n  ↓  Downloading {name} ({_gb(size)}, part {idx + 1}/{len(part_names)}) …")
+        stats["downloaded"] += 1
+        return Path(hf_hub_download(dataset_id, name, repo_type="dataset",
+                                    local_dir=str(parts_path)))
+
+    def release(idx: int) -> None:
+        p = reader.release(idx)
+        if p is None or keep_parts:
+            return
+        stats["freed"] += _delete_file(p)
+        print(f"\n  🗑  Deleted {part_names[idx]} (fully extracted)")
 
     print(f"  Extracting to {out_path} …")
     out_path.mkdir(parents=True, exist_ok=True)
+    reader = _MultiPartReader(sizes, fetch)
     try:
-        with source, zipfile.ZipFile(source) as zf:
-            members = [m for m in zf.infolist() if not m.is_dir()]
-            total = sum(m.file_size for m in members)
-            done_bytes = skipped = 0
+        with reader, zipfile.ZipFile(reader) as zf:
+            # Parts holding the zip index must stay until the end.
+            pinned = set(range(reader.part_index(zf.start_dir), len(part_names)))
+            members = sorted((m for m in zf.infolist() if not m.is_dir()),
+                             key=lambda m: m.header_offset)
+            skipped = 0
             try:
                 from tqdm import tqdm
-                bar = tqdm(total=total, unit="B", unit_scale=True, desc="  Extracting")
+                bar = tqdm(total=sum(m.file_size for m in members),
+                           unit="B", unit_scale=True, desc="  Extracting")
             except ImportError:
                 bar = None
             for m in members:
+                # Every part ending before this file starts is fully extracted.
+                for idx in reader.loaded():
+                    if idx not in pinned and reader.part_end(idx) <= m.header_offset:
+                        release(idx)
                 target = out_path / m.filename
-                # Resume support: skip files already fully written
                 if target.exists() and target.stat().st_size == m.file_size:
-                    skipped += 1
+                    skipped += 1                          # resume: already done
                 else:
                     zf.extract(m, out_path)
-                done_bytes += m.file_size
                 if bar:
                     bar.update(m.file_size)
             if bar:
                 bar.close()
+            for idx in reader.loaded():
+                release(idx)
     except Exception as e:
-        print(f"  ✗  Extraction failed: {e}")
-        print("     Re-run the same command to resume — finished files are skipped.")
+        print(f"\n  ✗  Extraction failed: {e}")
+        print("     Re-run the same command to resume — finished files are skipped and")
+        print(f"     parts already in {parts_path} are reused.")
         return False
 
     (out_path / _EXTRACT_MARKER).write_text(f"{dataset_id}\n{len(members)} files\n")
     print(f"  ✓  {len(members)} files ready at {out_path}"
           + (f" ({skipped} already present)" if skipped else ""))
-
-    if delete_parts:
-        freed = 0
-        for p in zip_parts + ([merged] if merged.exists() else []):
-            real = p.resolve()          # HF cache snapshots are symlinks to blobs
-            freed += real.stat().st_size
-            real.unlink()
-            if p.is_symlink():
-                p.unlink()
-        print(f"  ✓  Deleted downloaded zip parts, freed {_gb(freed)}")
-    else:
-        print("     Tip: pass --delete-parts to free the local disk used by the zip parts.")
-
+    print(f"     Parts downloaded: {stats['downloaded']}, local disk freed: {_gb(stats['freed'])}")
+    if not keep_parts:
+        shutil.rmtree(parts_path / ".cache", ignore_errors=True)   # hf_hub_download metadata
+        try:
+            parts_path.rmdir()
+        except OSError:
+            pass
     print(f"\n  config.yaml  →  sft.local_image_dir: {out_path}")
     return True
 
@@ -388,8 +449,11 @@ def main() -> None:
     p.add_argument("--image-out-dir", default=None,
                    help="Directory to extract images into "
                         "(default: sft.local_image_dir from config.yaml)")
-    p.add_argument("--delete-parts", action="store_true",
-                   help="Delete the downloaded zip parts after successful extraction")
+    p.add_argument("--parts-dir", default="./data/_image_zip_parts",
+                   help="Local scratch dir for zip parts while extracting "
+                        "(default: ./data/_image_zip_parts)")
+    p.add_argument("--keep-parts", action="store_true",
+                   help="Keep each zip part instead of deleting it once extracted")
     args = p.parse_args()
 
     run_image_setup = not args.exclude_setup_images and not args.check_only
@@ -405,7 +469,7 @@ def main() -> None:
         ("Model access",   check_model_accessible(args.check_only)),
     ]
     if run_image_setup:
-        checks.append(("Image setup", setup_images(args.image_dataset, image_out_dir, args.delete_parts)))
+        checks.append(("Image setup", setup_images(args.image_dataset, image_out_dir, args.parts_dir, args.keep_parts)))
     else:
         print("── Image setup ──────────────────────────────────────")
         print("  –  Skipped (--exclude-setup-images or --check-only)")
