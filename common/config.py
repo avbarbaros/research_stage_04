@@ -118,6 +118,7 @@ def base_argparser(description: str = "") -> "argparse.ArgumentParser":
     p.add_argument(
         "--set",
         nargs="*",
+        action="extend",          # repeated --set flags accumulate (default "store" keeps only the last)
         default=[],
         metavar="KEY=VALUE",
         help="Override config values, e.g. --set sft.max_samples=1000",

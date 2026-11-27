@@ -43,6 +43,9 @@ import argparse
 import json
 import os
 import sys
+
+# Reduce CUDA memory fragmentation (must be set before torch initialises CUDA).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -156,11 +159,22 @@ def load_base_model(cfg: Dict) -> tuple:
     # Cap image resolution: Qwen2.5-VL's default max_pixels (~12.8 MP) turns a
     # large document/chart image into >16k visual tokens (RAM/VRAM blow-up and
     # truncation of image tokens). Each 28×28 patch = 1 visual token.
-    pix_kwargs = {k: cfg["model"][k] for k in ("min_pixels", "max_pixels")
-                  if cfg["model"].get(k)}
-    processor = AutoProcessor.from_pretrained(model_name, **pix_kwargs)
-    if pix_kwargs:
-        print(f"[model] Processor image limits: {pix_kwargs}")
+    processor = AutoProcessor.from_pretrained(model_name)
+    min_px, max_px = cfg["model"].get("min_pixels"), cfg["model"].get("max_pixels")
+    if min_px or max_px:
+        # transformers ≥5 API: size={"shortest_edge": min_pixels, "longest_edge":
+        # max_pixels} (both are pixel *counts* for Qwen2-VL image processors).
+        ip = processor.image_processor
+        size = dict(ip.size or {})
+        if min_px:
+            size["shortest_edge"] = int(min_px)
+        if max_px:
+            size["longest_edge"] = int(max_px)
+        ip.size = size
+        for attr, val in (("min_pixels", min_px), ("max_pixels", max_px)):
+            if val and hasattr(ip, attr):        # older versions read these
+                setattr(ip, attr, int(val))
+        print(f"[model] Processor image limits: {size}")
 
     ModelClass = _get_model_class()
     model = ModelClass.from_pretrained(
