@@ -60,6 +60,7 @@ from common.config import (
     base_argparser,
 )
 from common.dataset_loaders import (
+    load_image,
     load_sft_dataset,
     load_mathvista,
     load_mathvision,
@@ -152,7 +153,14 @@ def load_base_model(cfg: Dict) -> tuple:
 
     print(f"[model] Loading {model_name}  dtype={cfg['model']['dtype']}  attn={attn_impl}")
 
-    processor = AutoProcessor.from_pretrained(model_name)
+    # Cap image resolution: Qwen2.5-VL's default max_pixels (~12.8 MP) turns a
+    # large document/chart image into >16k visual tokens (RAM/VRAM blow-up and
+    # truncation of image tokens). Each 28×28 patch = 1 visual token.
+    pix_kwargs = {k: cfg["model"][k] for k in ("min_pixels", "max_pixels")
+                  if cfg["model"].get(k)}
+    processor = AutoProcessor.from_pretrained(model_name, **pix_kwargs)
+    if pix_kwargs:
+        print(f"[model] Processor image limits: {pix_kwargs}")
 
     ModelClass = _get_model_class()
     model = ModelClass.from_pretrained(
@@ -189,6 +197,8 @@ def apply_lora(model: Any, cfg: Dict) -> Any:
 # ── SFT training ──────────────────────────────────────────────────────────────
 
 class _SFTDataset(Dataset):
+    """Holds undecoded image references; decodes one image per __getitem__."""
+
     def __init__(self, examples: List[Dict]):
         self.examples = examples
 
@@ -196,7 +206,13 @@ class _SFTDataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, idx: int) -> Dict:
-        return self.examples[idx]
+        # Fall through to the next example if an image turns out to be corrupt.
+        for k in range(len(self.examples)):
+            ex = self.examples[(idx + k) % len(self.examples)]
+            image = load_image(ex["image"])
+            if image is not None:
+                return {**ex, "image": image}
+        raise RuntimeError("No decodable images in the SFT dataset")
 
 
 def run_training(cfg: Dict, model: Any, processor: Any, run_dir: Path) -> Path:
@@ -318,12 +334,17 @@ def run_inference(
                 print(f"[eval:{benchmark_name}]  {i}/{len(todo)}  "
                       f"{rate:.1f} items/s  ETA {eta/60:.1f} min")
 
+            image = load_image(ex["image"])     # decode on demand (RAM)
+            if image is None:
+                print(f"[eval:{benchmark_name}] ⚠ could not decode image for {ex['id']} — skipped")
+                continue
+
             # Build prompt
             messages = [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": ex["image"]},
+                        {"type": "image", "image": image},
                         {"type": "text", "text": ex["question"]},
                     ],
                 }
@@ -334,7 +355,7 @@ def run_inference(
 
             inputs = processor(
                 text=[text],
-                images=[ex["image"]],
+                images=[image],
                 return_tensors="pt",
             ).to(device)
 

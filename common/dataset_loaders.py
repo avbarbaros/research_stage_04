@@ -26,8 +26,15 @@ def _to_pil(image_field: Any) -> Optional[Image.Image]:
         return image_field.convert("RGB")
     if isinstance(image_field, bytes):
         return Image.open(io.BytesIO(image_field)).convert("RGB")
-    if isinstance(image_field, dict) and "bytes" in image_field:
-        return Image.open(io.BytesIO(image_field["bytes"])).convert("RGB")
+    if isinstance(image_field, dict) and ("bytes" in image_field or "path" in image_field):
+        try:
+            if image_field.get("bytes"):
+                return Image.open(io.BytesIO(image_field["bytes"])).convert("RGB")
+            if image_field.get("path"):
+                return Image.open(image_field["path"]).convert("RGB")
+        except Exception:
+            return None
+        return None
     # Path object (resolved by caller from local_image_dir)
     if isinstance(image_field, Path):
         try:
@@ -53,6 +60,37 @@ def _to_pil(image_field: Any) -> Optional[Image.Image]:
     return None
 
 
+def load_image(image_field: Any) -> Optional[Image.Image]:
+    """
+    Decode an example's image on demand.
+
+    Loaders store images *undecoded* (a file Path or compressed bytes) so a
+    dataset of N examples doesn't hold N full-resolution RGB arrays in RAM;
+    call this right before the image is fed to the processor.
+    """
+    return _to_pil(image_field)
+
+
+def _has_image(image_field: Any) -> bool:
+    """Cheap check that an undecoded image field points at something."""
+    if image_field is None:
+        return False
+    if isinstance(image_field, Path):
+        return image_field.is_file()
+    if isinstance(image_field, dict):
+        return bool(image_field.get("bytes") or image_field.get("path"))
+    return True
+
+
+def _no_decode(ds):
+    """Make every datasets.Image column return compressed bytes, not PIL."""
+    from datasets import Image as HFImage
+    for col, feat in ds.features.items():
+        if isinstance(feat, HFImage):
+            ds = ds.cast_column(col, HFImage(decode=False))
+    return ds
+
+
 def _select_subset(items: list, max_samples: Optional[int], seed: int) -> list:
     if max_samples is None or max_samples >= len(items):
         return items
@@ -73,7 +111,7 @@ def load_sft_dataset(
 
     Returns a list of dicts with keys:
         id       : str
-        image    : PIL.Image
+        image    : undecoded image (Path / bytes dict) — decode with load_image()
         question : str   (user turn, without image placeholder tokens)
         answer   : str   (assistant turn — full CoT trace)
 
@@ -90,7 +128,7 @@ def load_sft_dataset(
     from datasets import load_dataset
 
     print(f"[dataset] Loading SFT dataset: {dataset_id}")
-    ds = load_dataset(dataset_id, split="train")
+    ds = _no_decode(load_dataset(dataset_id, split="train"))
     print(f"[dataset] Raw size: {len(ds)}")
 
     img_root = Path(local_image_dir) if local_image_dir else None
@@ -139,9 +177,9 @@ def _parse_sft_row(
     # Resolve relative path strings against the local image root
     if isinstance(img_field, str) and img_root is not None:
         img_field = img_root / img_field
-    image = _to_pil(img_field)
-    if image is None:
-        return None  # skip rows whose image cannot be loaded
+    if not _has_image(img_field):
+        return None  # skip rows whose image is missing
+    image = img_field  # decoded lazily (load_image) to keep RAM flat
 
     # Format 1: LLaVA conversations
     if "conversations" in row:
@@ -215,18 +253,18 @@ def load_mathvista(
     Load MathVista testmini.
 
     Returns dicts with keys:
-        id, image, question, answer, metadata
+        id, image (undecoded — see load_image), question, answer, metadata
     metadata includes: question_type, answer_type, choices
     """
     from datasets import load_dataset
 
     print(f"[dataset] Loading MathVista ({split})...")
-    ds = load_dataset(dataset_id, split=split, trust_remote_code=True)
+    ds = _no_decode(load_dataset(dataset_id, split=split, trust_remote_code=True))
 
     examples = []
     for row in ds:
-        image = _to_pil(row.get("decoded_image") or row.get("image"))
-        if image is None:
+        image = row.get("decoded_image") or row.get("image")
+        if not _has_image(image):
             continue
 
         # Build question text
@@ -274,14 +312,12 @@ def load_mathvision(
     from datasets import load_dataset
 
     print(f"[dataset] Loading MathVision ({split})...")
-    ds = load_dataset(dataset_id, split=split, trust_remote_code=True)
+    ds = _no_decode(load_dataset(dataset_id, split=split, trust_remote_code=True))
 
     examples = []
     for i, row in enumerate(ds):
-        image = _to_pil(
-            row.get("decoded_image") or row.get("image") or row.get("figure")
-        )
-        if image is None:
+        image = row.get("decoded_image") or row.get("image") or row.get("figure")
+        if not _has_image(image):
             continue
 
         question = str(row.get("question", row.get("problem", ""))).strip()
@@ -355,7 +391,7 @@ def load_mmmu(
     examples = []
     for subj in all_subjects:
         try:
-            ds = load_dataset(dataset_id, subj, split=split, trust_remote_code=True)
+            ds = _no_decode(load_dataset(dataset_id, subj, split=split, trust_remote_code=True))
         except Exception as e:
             print(f"[dataset] MMMU: skipping {subj}: {e}")
             continue
@@ -364,9 +400,10 @@ def load_mmmu(
             # MMMU can have up to 7 images; take the first non-None one
             image = None
             for img_key in ["image_1", "image_2", "image_3", "image_4"]:
-                image = _to_pil(row.get(img_key))
-                if image is not None:
+                image = row.get(img_key)
+                if _has_image(image):
                     break
+                image = None
             if image is None:
                 # Some MMMU questions have no image; skip for VLM eval
                 continue
