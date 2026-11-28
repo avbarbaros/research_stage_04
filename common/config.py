@@ -67,9 +67,10 @@ def make_run_dir(output_root: str, experiment_key: str, run_name: str) -> Path:
     return run_dir
 
 
-def save_resolved_config(cfg: Dict[str, Any], run_dir: Path) -> None:
+def save_resolved_config(cfg: Dict[str, Any], run_dir: Path,
+                         filename: str = "config_resolved.yaml") -> None:
     """Persist the fully-resolved config alongside the run outputs."""
-    with open(run_dir / "config_resolved.yaml", "w") as f:
+    with open(run_dir / filename, "w") as f:
         yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
 
 

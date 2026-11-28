@@ -27,29 +27,53 @@ def _extract_last_number(text: str) -> Optional[str]:
     return matches[-1] if matches else None
 
 
-def _extract_choice_letter(text: str) -> Optional[str]:
+def _answer_region(text: str) -> str:
     """
-    Extract the most likely multiple-choice answer letter (A-J) from a response.
+    The part of a response that holds the final answer.
 
-    Priority:
-      1. Explicit patterns like 'answer is (A)', 'answer: B', '**A**', '(A)'
-      2. Standalone letter at end of response
-      3. First standalone letter found
+    LLaVA-CoT-style models answer as <SUMMARY>…<CAPTION>…<REASONING>…<CONCLUSION>…;
+    the reasoning mentions many letters/numbers, so score only the conclusion
+    when present (also handles an unterminated conclusion cut off by max_new_tokens).
     """
-    text_clean = text.strip()
+    m = re.findall(r"<CONCLUSION>(.*?)(?:</CONCLUSION>|$)", text, re.S | re.I)
+    if m and m[-1].strip():
+        return m[-1].strip()
+    return text
 
-    # Pattern 1: explicit answer declarations
+
+def _extract_choice_letter(text: str, choices: Optional[List[str]] = None) -> Optional[str]:
+    """
+    Extract the multiple-choice answer letter (A-J) from a response.
+
+    Uses the LAST match of the strongest pattern found (CoT text discusses
+    several options before committing). Letters must be uppercase, so the
+    article "a" / pronoun "I" in prose are not mistaken for answers.
+    Falls back to matching the option text itself when `choices` is given.
+    """
+    text = _answer_region(text).strip()
+    if not text:
+        return None
+
     patterns = [
-        r"(?:answer|choice|option)\s*(?:is|:)\s*\(?([A-Ja-j])\)?",
-        r"\*\*([A-Ja-j])\*\*",          # bold
-        r"(?<!\w)\(([A-Ja-j])\)(?!\w)",  # (A)
-        r"(?<!\w)([A-Ja-j])(?:\.|$)",    # letter at end
+        r"(?i:answer|choice|option)(?:\s+is)?\s*[:：]?\s*\**\s*\(?([A-J])\)?(?![A-Za-z])",
+        r"\\boxed\{\s*\(?([A-J])\)?\s*\}",
+        r"\*\*\s*\(?([A-J])\)?\s*\*\*",                 # **B** / **(B)**
+        r"(?<![A-Za-z])\(([A-J])\)(?![A-Za-z])",            # (B)
+        r"^\s*([A-J])\s*(?:[.:)]|$)",                       # starts with "B." / just "B"
+        r"(?<![A-Za-z])([A-J])\s*[.)]?\s*$",                 # ends with "B" / "B."
     ]
     for pat in patterns:
-        m = re.search(pat, text_clean, re.IGNORECASE)
+        m = re.findall(pat, text)
         if m:
-            return m.group(1).upper()
+            return m[-1].upper()
 
+    # Fallback: the response states the option text instead of its letter
+    if choices:
+        low = text.lower()
+        hits = [(low.rfind(str(c).strip().lower()), i) for i, c in enumerate(choices)
+                if str(c).strip() and str(c).strip().lower() in low]
+        if hits:
+            return chr(65 + max(hits)[1])
     return None
 
 
@@ -76,11 +100,12 @@ def score_mathvista(response: str, gt_answer: str, metadata: Dict[str, Any]) -> 
     """
     q_type = metadata.get("question_type", "")
     a_type = metadata.get("answer_type", "")
+    response = _answer_region(response or "")
 
     if q_type == "multi_choice" or a_type in ("text", ""):
         # Multiple-choice
         choices = metadata.get("choices", [])
-        pred_letter = _extract_choice_letter(response)
+        pred_letter = _extract_choice_letter(response, choices)
         gt_letter = gt_answer.strip().upper()
 
         # Sometimes gt_answer is the full option text rather than a letter
@@ -127,6 +152,7 @@ def score_mathvision(response: str, gt_answer: str, metadata: Dict[str, Any]) ->
     MathVision is competition math; answers are almost always numeric or simple
     expressions. We extract the last \\boxed{} or last number and compare.
     """
+    response = _answer_region(response or "")
     pred = _extract_boxed(response) or _extract_last_number(response)
     if pred is None:
         pred = response.strip().split()[-1] if response.strip() else ""
@@ -149,15 +175,18 @@ def score_mmmu(response: str, gt_answer: str, metadata: Dict[str, Any]) -> bool:
     """
     Score an MMMU response.
 
-    MMMU is exclusively multiple-choice (A/B/C/D).
-    Ground truth is a single letter like 'A'.
+    Most MMMU items are multiple-choice (ground truth = one letter like 'A');
+    ~5% are open-ended (question_type == "open") and are scored like
+    MathVision (numeric tolerance, else exact string match).
     """
-    gt_letter = gt_answer.strip().upper()
-    if not gt_letter or gt_letter not in string.ascii_uppercase:
-        return False
+    gt = gt_answer.strip()
+    if metadata.get("question_type") == "open" or not (
+        len(gt) == 1 and gt.upper() in string.ascii_uppercase
+    ):
+        return score_mathvision(response, gt, metadata)
 
-    pred_letter = _extract_choice_letter(response)
-    return pred_letter == gt_letter
+    pred_letter = _extract_choice_letter(response, metadata.get("choices"))
+    return pred_letter == gt.upper()
 
 
 # ── Aggregate statistics ──────────────────────────────────────────────────────

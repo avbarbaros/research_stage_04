@@ -104,7 +104,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--run-dir",
         default=None,
-        help="Existing run directory (for --mode analyze)",
+        help="Existing run directory: required for --mode analyze; for train/eval "
+             "it resumes that run (latest training checkpoint + finished eval items)",
     )
     return p.parse_args()
 
@@ -287,8 +288,13 @@ def run_training(cfg: Dict, model: Any, processor: Any, run_dir: Path) -> Path:
         data_collator=collator,
     )
 
+    # Resume automatically when re-using a run dir that already has checkpoints
+    # (Colab sessions die; pass --run-dir <same dir> to continue).
+    has_ckpt = any(checkpoints_dir.glob("checkpoint-*"))
+    if has_ckpt:
+        print(f"[train] Resuming from latest checkpoint in {checkpoints_dir}")
     print("[train] Starting supervised fine-tuning …")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=True if has_ckpt else None)
 
     # Save final LoRA adapter
     adapter_path = run_dir / sc.get("adapter_subdir", "adapter_final")
@@ -336,7 +342,21 @@ def run_inference(
         return out_file
 
     model.eval()
+    # Training turned the KV cache off (needed for gradient checkpointing).
+    # Without it generate() re-encodes the whole sequence for every new token.
+    if getattr(model, "is_gradient_checkpointing", False):
+        model.gradient_checkpointing_disable()
+    model.config.use_cache = True
     device = next(model.parameters()).device
+
+    gen_kwargs = dict(
+        max_new_tokens=gc["max_new_tokens"],
+        do_sample=gc.get("do_sample", False),
+        use_cache=True,
+        pad_token_id=processor.tokenizer.eos_token_id,
+    )
+    if gen_kwargs["do_sample"]:                     # temperature is ignored for greedy
+        gen_kwargs["temperature"] = gc.get("temperature", 1.0)
 
     with open(out_file, "a", buffering=1) as fh:
         t0 = time.time()
@@ -374,13 +394,7 @@ def run_inference(
             ).to(device)
 
             with torch.no_grad():
-                output_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=gc["max_new_tokens"],
-                    temperature=gc.get("temperature", 0.0),
-                    do_sample=gc.get("do_sample", False),
-                    pad_token_id=processor.tokenizer.eos_token_id,
-                )
+                output_ids = model.generate(**inputs, **gen_kwargs)
 
             # Decode only the newly generated tokens
             prompt_len = inputs["input_ids"].shape[1]
@@ -496,13 +510,22 @@ def main() -> None:
         if not args.run_dir:
             sys.exit("[error] --mode analyze requires --run-dir")
         run_dir = Path(args.run_dir)
+    elif args.run_dir:
+        run_dir = Path(args.run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[main] Re-using run directory (resume): {run_dir}")
     else:
         run_dir = make_run_dir(
             cfg["output_root"],
             "e4_1",
             cfg.get("wandb", {}).get("run_name", "sft_baseline"),
         )
-        save_resolved_config(cfg, run_dir)
+    if args.mode != "analyze":
+        # Don't clobber the training run's config when re-using its directory
+        name = "config_resolved.yaml"
+        if (run_dir / name).exists():
+            name = f"config_resolved_{args.mode}_{time.strftime('%Y%m%d_%H%M%S')}.yaml"
+        save_resolved_config(cfg, run_dir, name)
     print(f"[main] Run directory: {run_dir}")
 
     # ── W&B init ───────────────────────────────────────────────────────────

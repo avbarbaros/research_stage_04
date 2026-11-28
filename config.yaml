@@ -49,7 +49,7 @@ sft:
   max_seq_len: 2048
   dataloader_num_workers: 2
   logging_steps: 50
-  save_steps: 500
+  save_steps: 200          # ~80 min at ~25 s/step on an L4 — limits work lost to a Colab disconnect
   save_total_limit: 2
   # output subdir inside output_root/e4_1/<run_name>/
   checkpoints_subdir: checkpoints

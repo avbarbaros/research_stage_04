@@ -259,7 +259,7 @@ def load_mathvista(
     from datasets import load_dataset
 
     print(f"[dataset] Loading MathVista ({split})...")
-    ds = _no_decode(load_dataset(dataset_id, split=split, trust_remote_code=True))
+    ds = _no_decode(load_dataset(dataset_id, split=split))
 
     examples = []
     for row in ds:
@@ -312,7 +312,7 @@ def load_mathvision(
     from datasets import load_dataset
 
     print(f"[dataset] Loading MathVision ({split})...")
-    ds = _no_decode(load_dataset(dataset_id, split=split, trust_remote_code=True))
+    ds = _no_decode(load_dataset(dataset_id, split=split))
 
     examples = []
     for i, row in enumerate(ds):
@@ -391,7 +391,7 @@ def load_mmmu(
     examples = []
     for subj in all_subjects:
         try:
-            ds = _no_decode(load_dataset(dataset_id, subj, split=split, trust_remote_code=True))
+            ds = _no_decode(load_dataset(dataset_id, subj, split=split))
         except Exception as e:
             print(f"[dataset] MMMU: skipping {subj}: {e}")
             continue
@@ -410,6 +410,13 @@ def load_mmmu(
 
             question = str(row.get("question", "")).strip()
             options_raw = row.get("options", [])
+            # HF MMMU stores options as a Python-repr *string*: "['a', 'b', ...]"
+            if isinstance(options_raw, str):
+                import ast
+                try:
+                    options_raw = ast.literal_eval(options_raw)
+                except (ValueError, SyntaxError):
+                    options_raw = []
             if isinstance(options_raw, list) and options_raw:
                 lettered = [f"({chr(65+j)}) {c}" for j, c in enumerate(options_raw)]
                 question = question + "\n" + "  ".join(lettered)
@@ -425,6 +432,8 @@ def load_mmmu(
                 "answer": answer,
                 "metadata": {
                     "subject": subj,
+                    "question_type": row.get("question_type", ""),
+                    "choices": options_raw if isinstance(options_raw, list) else [],
                     "topic": row.get("topic", ""),
                     "image_type": row.get("img_type", ""),
                 },
